@@ -88,6 +88,31 @@ pub(crate) const RGS_SYNC_TIMEOUT_SECS: u64 = 5;
 /// The length in bytes of our wallets' keys seed.
 pub const WALLET_KEYS_SEED_LEN: usize = 64;
 
+/// Defines how the node handles incoming payments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaymentClaimPolicy {
+	/// Automatically claim payments when the preimage is known (default behavior).
+	///
+	/// The node will attempt to automatically claim or fail HTLCs based on whether
+	/// a preimage is available in the payment store.
+	Auto,
+	/// Manual claim policy - do not auto-claim or auto-fail payments.
+	///
+	/// When this policy is set, the node will emit `PaymentClaimable` events to the
+	/// application, which must manually call `claim_for_hash()` or `fail_for_hash()`
+	/// to resolve the payment.
+	///
+	/// This is useful for applications that need to perform additional validation or
+	/// processing before accepting a payment.
+	Manual,
+}
+
+impl Default for PaymentClaimPolicy {
+	fn default() -> Self {
+		PaymentClaimPolicy::Auto
+	}
+}
+
 #[derive(Debug, Clone)]
 /// Represents the configuration of an [`Node`] instance.
 ///
@@ -173,6 +198,12 @@ pub struct Config {
 	/// **Note:** If unset, default parameters will be used, and you will be able to override the
 	/// parameters on a per-payment basis in the corresponding method calls.
 	pub sending_parameters: Option<SendingParameters>,
+	/// The policy for handling incoming payment claims.
+	///
+	/// - `PaymentClaimPolicy::Auto` (default): The node automatically claims payments when preimages are available.
+	/// - `PaymentClaimPolicy::Manual`: The node emits `PaymentClaimable` events without auto-claiming,
+	///   allowing the application to manually call `claim_for_hash()` or `fail_for_hash()`.
+	pub payment_claim_policy: PaymentClaimPolicy,
 }
 
 impl Default for Config {
@@ -187,6 +218,7 @@ impl Default for Config {
 			anchor_channels_config: Some(AnchorChannelsConfig::default()),
 			sending_parameters: None,
 			node_alias: None,
+			payment_claim_policy: PaymentClaimPolicy::default(),
 		}
 	}
 }

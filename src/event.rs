@@ -825,25 +825,66 @@ where
 				if let Some(preimage) = payment_preimage {
 					self.channel_manager.claim_funds(preimage);
 				} else {
-					log_error!(
-						self.logger,
-						"Failed to claim payment with ID {}: preimage unknown.",
-						payment_id,
-					);
-					self.channel_manager.fail_htlc_backwards(&payment_hash);
+					// Check the payment claim policy to determine how to handle payments without preimages
+					match self.config.payment_claim_policy {
+						crate::config::PaymentClaimPolicy::Auto => {
+							// Auto mode: fail the HTLC if preimage is unknown (existing behavior)
+							log_error!(
+								self.logger,
+								"Failed to claim payment with ID {}: preimage unknown.",
+								payment_id,
+							);
+							self.channel_manager.fail_htlc_backwards(&payment_hash);
 
-					let update = PaymentDetailsUpdate {
-						hash: Some(Some(payment_hash)),
-						status: Some(PaymentStatus::Failed),
-						..PaymentDetailsUpdate::new(payment_id)
-					};
-					match self.payment_store.update(&update) {
-						Ok(_) => return Ok(()),
-						Err(e) => {
-							log_error!(self.logger, "Failed to access payment store: {}", e);
-							return Err(ReplayEvent());
+							let update = PaymentDetailsUpdate {
+								hash: Some(Some(payment_hash)),
+								status: Some(PaymentStatus::Failed),
+								..PaymentDetailsUpdate::new(payment_id)
+							};
+							match self.payment_store.update(&update) {
+								Ok(_) => return Ok(()),
+								Err(e) => {
+									log_error!(self.logger, "Failed to access payment store: {}", e);
+									return Err(ReplayEvent());
+								},
+							};
 						},
-					};
+						crate::config::PaymentClaimPolicy::Manual => {
+							// Manual mode: do NOT auto-claim or auto-fail
+							// Emit the PaymentClaimable event so the application can handle it
+							log_info!(
+								self.logger,
+								"Received manual-claim payment with ID {}. Application must call claim_for_hash() or fail_for_hash().",
+								payment_id,
+							);
+							
+							let custom_records = onion_fields
+								.and_then(|cf| {
+									Some(cf.custom_tlvs().into_iter().map(|tlv| tlv.into()).collect())
+								})
+								.unwrap_or_default();
+							
+							let event = Event::PaymentClaimable {
+								payment_id,
+								payment_hash,
+								claimable_amount_msat: amount_msat,
+								claim_deadline,
+								custom_records,
+							};
+							
+							match self.event_queue.add_event(event) {
+								Ok(_) => return Ok(()),
+								Err(e) => {
+									log_error!(
+										self.logger,
+										"Failed to push to event queue: {}",
+										e
+									);
+									return Err(ReplayEvent());
+								},
+							};
+						},
+					}
 				}
 			},
 			LdkEvent::PaymentClaimed {

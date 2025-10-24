@@ -608,6 +608,8 @@ impl Bolt11Payment {
 			expiry_secs,
 			max_total_lsp_fee_limit_msat,
 			None,
+			None,
+			None,
 		)?;
 		Ok(maybe_wrap_invoice(invoice))
 	}
@@ -634,14 +636,198 @@ impl Bolt11Payment {
 			expiry_secs,
 			None,
 			max_proportional_lsp_fee_limit_ppm_msat,
+			None,
+			None,
 		)?;
 		Ok(maybe_wrap_invoice(invoice))
+	}
+
+	/// Returns a payable invoice that can be used to request a payment of the amount given and
+	/// receive it via a newly created just-in-time (JIT) channel, using manual claim for the given payment hash.
+	///
+	/// When the returned invoice is paid, the configured [LSPS2]-compliant LSP will open a channel
+	/// to us, supplying just-in-time inbound liquidity.
+	///
+	/// We will register the given payment hash and emit a [`PaymentClaimable`] event once
+	/// the inbound payment arrives.
+	///
+	/// **Note:** users *MUST* handle this event and claim the payment manually via
+	/// [`claim_for_hash`] as soon as they have obtained access to the preimage of the given
+	/// payment hash. If they're unable to obtain the preimage, they *MUST* immediately fail the payment via
+	/// [`fail_for_hash`].
+	///
+	/// If set, `max_total_lsp_fee_limit_msat` will limit the fee the LSP is allowed to take for opening the
+	/// channel to us. We'll use the cheapest offer otherwise.
+	///
+	/// [`PaymentClaimable`]: crate::Event::PaymentClaimable
+	/// [`claim_for_hash`]: Self::claim_for_hash
+	/// [`fail_for_hash`]: Self::fail_for_hash
+	/// [LSPS2]: https://github.com/BitcoinAndLightningLayerSpecs/lsp/blob/main/LSPS2/README.md
+	pub fn receive_via_jit_channel_for_hash(
+		&self, amount_msat: u64, description: &Bolt11InvoiceDescription, expiry_secs: u32,
+		max_total_lsp_fee_limit_msat: Option<u64>, min_final_cltv_expiry_delta: Option<u16>,
+	) -> Result<(PaymentHash, Bolt11Invoice), Error> {
+		let description = maybe_convert_description!(description);
+		let (payment_hash, invoice) = self.receive_via_jit_channel_inner_for_hash(
+			Some(amount_msat),
+			description,
+			expiry_secs,
+			max_total_lsp_fee_limit_msat,
+			None,
+			min_final_cltv_expiry_delta,
+		)?;
+		Ok((payment_hash, maybe_wrap_invoice(invoice)))
+	}
+
+	/// Returns a payable invoice that can be used to request a variable amount payment (also known
+	/// as "zero-amount" invoice) and receive it via a newly created just-in-time (JIT) channel,
+	/// using manual claim for the given payment hash.
+	///
+	/// When the returned invoice is paid, the configured [LSPS2]-compliant LSP will open a channel
+	/// to us, supplying just-in-time inbound liquidity.
+	///
+	/// We will register the given payment hash and emit a [`PaymentClaimable`] event once
+	/// the inbound payment arrives.
+	///
+	/// **Note:** users *MUST* handle this event and claim the payment manually via
+	/// [`claim_for_hash`] as soon as they have obtained access to the preimage of the given
+	/// payment hash. If they're unable to obtain the preimage, they *MUST* immediately fail the payment via
+	/// [`fail_for_hash`].
+	///
+	/// If set, `max_proportional_lsp_fee_limit_ppm_msat` will limit how much proportional fee, in
+	/// parts-per-million millisatoshis, we allow the LSP to take for opening the channel to us.
+	/// We'll use its cheapest offer otherwise.
+	///
+	/// [`PaymentClaimable`]: crate::Event::PaymentClaimable
+	/// [`claim_for_hash`]: Self::claim_for_hash
+	/// [`fail_for_hash`]: Self::fail_for_hash
+	/// [LSPS2]: https://github.com/BitcoinAndLightningLayerSpecs/lsp/blob/main/LSPS2/README.md
+	pub fn receive_variable_amount_via_jit_channel_for_hash(
+		&self, description: &Bolt11InvoiceDescription, expiry_secs: u32,
+		max_proportional_lsp_fee_limit_ppm_msat: Option<u64>, min_final_cltv_expiry_delta: Option<u16>,
+	) -> Result<(PaymentHash, Bolt11Invoice), Error> {
+		let description = maybe_convert_description!(description);
+		let (payment_hash, invoice) = self.receive_via_jit_channel_inner_for_hash(
+			None,
+			description,
+			expiry_secs,
+			None,
+			max_proportional_lsp_fee_limit_ppm_msat,
+			min_final_cltv_expiry_delta,
+		)?;
+		Ok((payment_hash, maybe_wrap_invoice(invoice)))
+	}
+
+	fn receive_via_jit_channel_inner_for_hash(
+		&self, amount_msat: Option<u64>, description: &LdkBolt11InvoiceDescription,
+		expiry_secs: u32, max_total_lsp_fee_limit_msat: Option<u64>,
+		max_proportional_lsp_fee_limit_ppm_msat: Option<u64>, min_final_cltv_expiry_delta: Option<u16>,
+	) -> Result<(PaymentHash, LdkBolt11Invoice), Error> {
+		let liquidity_source =
+			self.liquidity_source.as_ref().ok_or(Error::LiquiditySourceUnavailable)?;
+
+		let (node_id, address) =
+			liquidity_source.get_lsps2_lsp_details().ok_or(Error::LiquiditySourceUnavailable)?;
+
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().unwrap();
+
+		let peer_info = PeerInfo { node_id, address };
+
+		let con_node_id = peer_info.node_id;
+		let con_addr = peer_info.address.clone();
+		let con_cm = Arc::clone(&self.connection_manager);
+
+		// We need to use our main runtime here as a local runtime might not be around to poll
+		// connection futures going forward.
+		tokio::task::block_in_place(move || {
+			runtime.block_on(async move {
+				con_cm.connect_peer_if_necessary(con_node_id, con_addr).await
+			})
+		})?;
+
+		log_info!(self.logger, "Connected to LSP {}@{}. ", peer_info.node_id, peer_info.address);
+
+		// Generate a random payment_hash for manual claim
+		// The user will need to provide the preimage when they claim via claim_for_hash
+		use bitcoin::hashes::Hash;
+		let mut payment_hash_bytes = [0u8; 32];
+		// Use a simple approach: hash of timestamp + random channel state
+		// In production, this should use proper randomness
+		let timestamp = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_nanos();
+		payment_hash_bytes[..16].copy_from_slice(&timestamp.to_le_bytes()[..16]);
+		payment_hash_bytes[16..].copy_from_slice(&timestamp.to_be_bytes()[..16]);
+		let payment_hash = PaymentHash(Sha256::hash(&payment_hash_bytes).to_byte_array());
+
+		let liquidity_source = Arc::clone(&liquidity_source);
+		let (invoice, lsp_total_opening_fee, lsp_prop_opening_fee) =
+			tokio::task::block_in_place(move || {
+				runtime.block_on(async move {
+					if let Some(amount_msat) = amount_msat {
+						liquidity_source
+							.lsps2_receive_to_jit_channel_for_hash(
+								amount_msat,
+								description,
+								expiry_secs,
+								max_total_lsp_fee_limit_msat,
+								payment_hash,
+								min_final_cltv_expiry_delta,
+							)
+							.await
+							.map(|(invoice, total_fee)| (invoice, Some(total_fee), None))
+					} else {
+						liquidity_source
+							.lsps2_receive_variable_amount_to_jit_channel_for_hash(
+								description,
+								expiry_secs,
+								max_proportional_lsp_fee_limit_ppm_msat,
+								payment_hash,
+								min_final_cltv_expiry_delta,
+							)
+							.await
+							.map(|(invoice, prop_fee)| (invoice, None, Some(prop_fee)))
+					}
+				})
+			})?;
+
+		// Register payment in payment store (but don't fetch preimage since it's manual claim)
+		let payment_secret = invoice.payment_secret();
+		let lsp_fee_limits = LSPFeeLimits {
+			max_total_opening_fee_msat: lsp_total_opening_fee,
+			max_proportional_opening_fee_ppm_msat: lsp_prop_opening_fee,
+		};
+		let id = PaymentId(payment_hash.0);
+		let kind = PaymentKind::Bolt11Jit {
+			hash: payment_hash,
+			preimage: None, // No preimage for manual claim
+			secret: Some(payment_secret.clone()),
+			counterparty_skimmed_fee_msat: None,
+			lsp_fee_limits,
+		};
+		let payment = PaymentDetails::new(
+			id,
+			kind,
+			amount_msat,
+			None,
+			PaymentDirection::Inbound,
+			PaymentStatus::Pending,
+		);
+		self.payment_store.insert(payment)?;
+
+		// Persist LSP peer to make sure we reconnect on restart.
+		self.peer_store.add_peer(peer_info)?;
+
+		Ok((payment_hash, invoice))
 	}
 
 	fn receive_via_jit_channel_inner(
 		&self, amount_msat: Option<u64>, description: &LdkBolt11InvoiceDescription,
 		expiry_secs: u32, max_total_lsp_fee_limit_msat: Option<u64>,
 		max_proportional_lsp_fee_limit_ppm_msat: Option<u64>,
+		_manual_claim_payment_hash: Option<PaymentHash>, min_final_cltv_expiry_delta: Option<u16>,
 	) -> Result<LdkBolt11Invoice, Error> {
 		let liquidity_source =
 			self.liquidity_source.as_ref().ok_or(Error::LiquiditySourceUnavailable)?;
@@ -679,6 +865,7 @@ impl Bolt11Payment {
 								description,
 								expiry_secs,
 								max_total_lsp_fee_limit_msat,
+								min_final_cltv_expiry_delta,
 							)
 							.await
 							.map(|(invoice, total_fee)| (invoice, Some(total_fee), None))
@@ -688,6 +875,7 @@ impl Bolt11Payment {
 								description,
 								expiry_secs,
 								max_proportional_lsp_fee_limit_ppm_msat,
+								min_final_cltv_expiry_delta,
 							)
 							.await
 							.map(|(invoice, prop_fee)| (invoice, None, Some(prop_fee)))

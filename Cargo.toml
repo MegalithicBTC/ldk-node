@@ -102,6 +102,7 @@ lightning = { version = "0.1.0", features = ["std", "_test_utils"] }
 #lightning = { path = "../rust-lightning/lightning", features = ["std", "_test_utils"] }
 proptest = "1.0.0"
 regex = "1.5.6"
+dotenvy = "0.15"
 
 [target.'cfg(not(no_download))'.dev-dependencies]
 electrsd = { version = "0.35.0", default-features = false, features = ["legacy", "esplora_a33e97e1", "corepc-node_27_2"] }

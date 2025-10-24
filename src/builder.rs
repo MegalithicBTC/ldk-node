@@ -459,6 +459,18 @@ impl NodeBuilder {
 		Ok(self)
 	}
 
+	/// Sets the payment claim policy.
+	///
+	/// - `PaymentClaimPolicy::Auto` (default): Automatically claim payments when preimages are available.
+	/// - `PaymentClaimPolicy::Manual`: Emit `PaymentClaimable` events without auto-claiming,
+	///   allowing manual control via `claim_for_hash()` or `fail_for_hash()`.
+	pub fn set_payment_claim_policy(
+		&mut self, policy: crate::config::PaymentClaimPolicy,
+	) -> &mut Self {
+		self.config.payment_claim_policy = policy;
+		self
+	}
+
 	/// Builds a [`Node`] instance with a [`SqliteStore`] backend and according to the options
 	/// previously configured.
 	pub fn build(&self) -> Result<Node, BuildError> {
